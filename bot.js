@@ -148,6 +148,44 @@ function getStats() {
 function findYtDlpPath() {
   const { execSync } = require('child_process');
   
+  // First, check virtualenv bin directory (for Render and other venv environments)
+  if (process.env.VIRTUAL_ENV) {
+    const venvBin = path.join(process.env.VIRTUAL_ENV, 'bin', 'yt-dlp');
+    if (fs.existsSync(venvBin)) {
+      try {
+        execSync(`"${venvBin}" --version`, { stdio: 'ignore' });
+        console.log(`[${new Date().toISOString()}] Found yt-dlp in virtualenv: ${venvBin}`);
+        return venvBin;
+      } catch (e) {
+        // File exists but not executable, continue
+      }
+    }
+  }
+  
+  // Second, check bin directory in project root (for Render builds)
+  const projectBinDir = path.join(__dirname, 'bin');
+  const ytDlpInBin = path.join(projectBinDir, 'yt-dlp');
+  if (fs.existsSync(ytDlpInBin)) {
+    try {
+      // Try to make it executable if it's not
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(ytDlpInBin, 0o755);
+        } catch (chmodErr) {
+          // Ignore chmod errors
+        }
+      }
+      // Use absolute path without quotes for Linux
+      const execPath = process.platform === 'win32' ? `"${ytDlpInBin}"` : ytDlpInBin;
+      execSync(`${execPath} --version`, { stdio: 'ignore', timeout: 5000 });
+      console.log(`[${new Date().toISOString()}] Found yt-dlp in bin directory: ${ytDlpInBin}`);
+      return ytDlpInBin;
+    } catch (e) {
+      console.log(`[${new Date().toISOString()}] yt-dlp exists at ${ytDlpInBin} but execution failed: ${e.message}`);
+      // File exists but not executable, continue
+    }
+  }
+  
   // Try to find yt-dlp in PATH and get full path
   try {
     // On Linux/Mac, use 'which' to get full path
@@ -201,19 +239,27 @@ function findYtDlpPath() {
     }
   }
   
-  // Fallback: try python -m yt_dlp
+  // Fallback: try python -m yt_dlp or python3 -m yt_dlp
   try {
-    execSync('python -m yt_dlp --version', { stdio: 'ignore' });
-    console.log(`[${new Date().toISOString()}] Using python -m yt_dlp`);
-    return 'python';
+    execSync('python3 -m yt_dlp --version', { stdio: 'ignore' });
+    console.log(`[${new Date().toISOString()}] Using python3 -m yt_dlp`);
+    return 'python3';
   } catch (e) {
-    // Not found
+    // python3 not found, try python
+    try {
+      execSync('python -m yt_dlp --version', { stdio: 'ignore' });
+      console.log(`[${new Date().toISOString()}] Using python -m yt_dlp`);
+      return 'python';
+    } catch (e2) {
+      // Not found
+    }
   }
   
   return null;
 }
 
 // Add common installation paths to PATH (for Render and other cloud platforms)
+// IMPORTANT: Do this BEFORE calling findYtDlpPath() so it can find yt-dlp in these locations
 if (process.env.HOME) {
   const localBin = path.join(process.env.HOME, '.local', 'bin');
   if (fs.existsSync(localBin) && !process.env.PATH.includes(localBin)) {
@@ -221,20 +267,82 @@ if (process.env.HOME) {
   }
 }
 
+// Add virtualenv bin directory to PATH (for Render and other platforms using venv)
+if (process.env.VIRTUAL_ENV) {
+  const venvBin = path.join(process.env.VIRTUAL_ENV, 'bin');
+  if (fs.existsSync(venvBin) && !process.env.PATH.includes(venvBin)) {
+    process.env.PATH = `${venvBin}:${process.env.PATH}`;
+    console.log(`[${new Date().toISOString()}] Added virtualenv bin to PATH: ${venvBin}`);
+  }
+}
+
+// Add bin directory in project root (for Render builds)
+const projectBinDir = path.join(__dirname, 'bin');
+if (fs.existsSync(projectBinDir) && !process.env.PATH.includes(projectBinDir)) {
+  process.env.PATH = `${projectBinDir}:${process.env.PATH}`;
+  // Also check for yt-dlp in this directory
+  const ytDlpInBin = path.join(projectBinDir, 'yt-dlp');
+  if (fs.existsSync(ytDlpInBin)) {
+    console.log(`[${new Date().toISOString()}] Found yt-dlp in bin directory: ${ytDlpInBin}`);
+  }
+}
+
+// Debug: Log environment info
+console.log(`[${new Date().toISOString()}] Current working directory: ${process.cwd()}`);
+console.log(`[${new Date().toISOString()}] __dirname: ${__dirname}`);
+console.log(`[${new Date().toISOString()}] VIRTUAL_ENV: ${process.env.VIRTUAL_ENV || 'not set'}`);
+console.log(`[${new Date().toISOString()}] PATH: ${process.env.PATH}`);
+
+// Check if bin directory exists
+const debugBinDir = path.join(__dirname, 'bin');
+console.log(`[${new Date().toISOString()}] Checking bin directory: ${debugBinDir}`);
+if (fs.existsSync(debugBinDir)) {
+  const files = fs.readdirSync(debugBinDir);
+  console.log(`[${new Date().toISOString()}] Files in bin directory: ${files.join(', ')}`);
+  const ytDlpInBin = path.join(debugBinDir, 'yt-dlp');
+  if (fs.existsSync(ytDlpInBin)) {
+    const stats = fs.statSync(ytDlpInBin);
+    console.log(`[${new Date().toISOString()}] yt-dlp file exists: ${ytDlpInBin}, size: ${stats.size}, mode: ${stats.mode.toString(8)}`);
+  } else {
+    console.log(`[${new Date().toISOString()}] yt-dlp file NOT found at: ${ytDlpInBin}`);
+  }
+} else {
+  console.log(`[${new Date().toISOString()}] bin directory does NOT exist: ${debugBinDir}`);
+}
+
 const ytDlpPath = findYtDlpPath();
 if (!ytDlpPath) {
   console.error(`[${new Date().toISOString()}] yt-dlp not found. Please install it: pip install yt-dlp`);
   console.error(`[${new Date().toISOString()}] On Render: The build script should install it automatically.`);
   console.error(`[${new Date().toISOString()}] If this persists, check that Python and pip are available.`);
+  console.error(`[${new Date().toISOString()}] Searched locations:`);
+  console.error(`[${new Date().toISOString()}]   - Virtualenv: ${process.env.VIRTUAL_ENV ? path.join(process.env.VIRTUAL_ENV, 'bin', 'yt-dlp') : 'N/A'}`);
+  console.error(`[${new Date().toISOString()}]   - Project bin: ${debugBinDir}/yt-dlp`);
+  console.error(`[${new Date().toISOString()}]   - PATH: ${process.env.PATH}`);
   process.exit(1);
 }
 
-// If we found the full path, use it; otherwise use the command name
-const finalYtDlpPath = (ytDlpPath === 'python') 
-  ? path.join(process.env.APPDATA || '', 'Python', 'Python314', 'Scripts', 'yt-dlp.exe')
-  : ytDlpPath;
+// If we found python/python3, try to find the actual binary in virtualenv first
+if ((ytDlpPath === 'python' || ytDlpPath === 'python3') && process.env.VIRTUAL_ENV) {
+  const venvYtDlp = path.join(process.env.VIRTUAL_ENV, 'bin', 'yt-dlp');
+  if (fs.existsSync(venvYtDlp)) {
+    try {
+      const { execSync } = require('child_process');
+      execSync(`${venvYtDlp} --version`, { stdio: 'ignore', timeout: 5000 });
+      console.log(`[${new Date().toISOString()}] Found yt-dlp binary in virtualenv: ${venvYtDlp}`);
+      ytDlpPath = venvYtDlp;
+    } catch (e) {
+      // Keep python command as fallback
+    }
+  }
+}
 
+const finalYtDlpPath = ytDlpPath;
 console.log(`[${new Date().toISOString()}] Using yt-dlp at: ${finalYtDlpPath}`);
+
+// Create yt-dlp-wrap instance
+// Note: yt-dlp-wrap expects a binary path, not a python command
+// If we have python command, we'll need to handle it differently
 const ytDlpWrap = new YTDlpWrap(finalYtDlpPath, {
   timeout: 600000 // 10 minutes timeout for yt-dlp operations
 });
