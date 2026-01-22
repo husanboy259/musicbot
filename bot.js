@@ -3,8 +3,36 @@ const { Telegraf, Markup } = require('telegraf');
 const YTDlpWrap = require('yt-dlp-wrap').default;
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+// Create a custom HTTPS agent with longer timeout and keep-alive
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 50,
+  timeout: 120000, // 120 seconds timeout
+  // Connection timeout
+  connectTimeout: 30000, // 30 seconds to establish connection
+  // Allow self-signed certificates if needed (for corporate proxies)
+  rejectUnauthorized: true
+});
+
+// Configure bot with timeout and retry settings
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, {
+  telegram: {
+    // Set timeout for API requests (120 seconds - very long for slow/unstable connections)
+    timeout: 120000,
+    // Retry configuration
+    retryAfter: 3000, // Wait 3 seconds before retry
+    // Maximum number of retries
+    maxRetries: 5, // Increased retries
+    // Use custom HTTPS agent for better connection handling
+    agent: httpsAgent,
+    apiRoot: 'https://api.telegram.org',
+    // Additional options
+    webhookReply: false // Use polling, not webhooks
+  }
+});
 
 // Admin ID from environment variable (can be ADMIN_ID or id)
 const ADMIN_ID = parseInt(process.env.ADMIN_ID || process.env.id) || null;
@@ -197,7 +225,9 @@ const finalYtDlpPath = (ytDlpPath === 'python')
   : ytDlpPath;
 
 console.log(`[${new Date().toISOString()}] Using yt-dlp at: ${finalYtDlpPath}`);
-const ytDlpWrap = new YTDlpWrap(finalYtDlpPath);
+const ytDlpWrap = new YTDlpWrap(finalYtDlpPath, {
+  timeout: 600000 // 10 minutes timeout for yt-dlp operations
+});
 
 
 // Store user states for YouTube format selection
@@ -218,14 +248,20 @@ async function downloadInstagramMedia(ctx, messageText) {
   
   if (!instagramUrlPattern.test(messageText)) {
     console.log(`[${new Date().toISOString()}] Invalid Instagram URL format: ${messageText}`);
-    ctx.reply('Please send a valid Instagram link. Example: https://www.instagram.com/p/...');
+    await safeReply(ctx, 'Please send a valid Instagram link. Example: https://www.instagram.com/p/...');
     return;
   }
 
   console.log(`[${new Date().toISOString()}] Valid Instagram URL received: ${messageText}`);
 
   // Send processing message
-  const processingMsg = await ctx.reply('Downloading media... Please wait.');
+  let processingMsg;
+  try {
+    processingMsg = await ctx.reply('Downloading media... Please wait.');
+  } catch (error) {
+    console.warn(`[${new Date().toISOString()}] Could not send processing message, continuing anyway:`, error.message);
+    processingMsg = null;
+  }
 
   try {
     // Check if yt-dlp binary exists (skip check if it's a command name in PATH)
@@ -372,12 +408,19 @@ async function downloadInstagramMedia(ctx, messageText) {
     if (fileSizeInMB > 50) {
       console.log(`[${new Date().toISOString()}] File too large (${fileSizeInMB.toFixed(2)} MB), deleting...`);
       fs.unlinkSync(actualOutputPath);
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        null,
-        'File is too large (over 50MB). Telegram bots cannot send files larger than 50MB.'
-      );
+      if (processingMsg && processingMsg.message_id) {
+        try {
+          await safeTelegramCall(
+            ctx.telegram.editMessageText.bind(ctx.telegram),
+            ctx.chat.id,
+            processingMsg.message_id,
+            null,
+            'File is too large (over 50MB). Telegram bots cannot send files larger than 50MB.'
+          );
+        } catch (err) {
+          console.warn(`[${new Date().toISOString()}] Could not edit message:`, err.message);
+        }
+      }
       return;
     }
 
@@ -385,7 +428,8 @@ async function downloadInstagramMedia(ctx, messageText) {
     
     // Send media file based on type
     if (actualIsImage) {
-      await ctx.telegram.sendPhoto(
+      await safeTelegramCall(
+        ctx.telegram.sendPhoto.bind(ctx.telegram),
         ctx.chat.id,
         { source: actualOutputPath },
         {
@@ -394,7 +438,8 @@ async function downloadInstagramMedia(ctx, messageText) {
       );
       console.log(`[${new Date().toISOString()}] Image sent successfully`);
     } else {
-      await ctx.telegram.sendVideo(
+      await safeTelegramCall(
+        ctx.telegram.sendVideo.bind(ctx.telegram),
         ctx.chat.id,
         { source: actualOutputPath },
         {
@@ -405,11 +450,17 @@ async function downloadInstagramMedia(ctx, messageText) {
     }
 
     // Delete processing message
-    await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+    if (processingMsg && processingMsg.message_id) {
+      try {
+        await safeTelegramCall(ctx.telegram.deleteMessage.bind(ctx.telegram), ctx.chat.id, processingMsg.message_id);
+      } catch (err) {
+        console.warn(`[${new Date().toISOString()}] Could not delete processing message:`, err.message);
+      }
+    }
 
     // Show success message
     const mediaType = actualIsImage ? 'Image' : 'Video';
-    await ctx.reply(`✅ ${mediaType} downloaded successfully!\n\nSend another Instagram link to download more.`);
+    await safeReply(ctx, `✅ ${mediaType} downloaded successfully!\n\nSend another Instagram link to download more.`);
 
     // Clean up temporary file
     try {
@@ -430,16 +481,21 @@ async function downloadInstagramMedia(ctx, messageText) {
     }
     
     // Try to delete processing message
-    try {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        null,
-        'Sorry, I couldn\'t download the media. Please check if the link is valid and the content is public.'
-      );
-    } catch (err) {
-      console.error(`[${new Date().toISOString()}] Error editing message:`, err);
-      ctx.reply('Sorry, I couldn\'t download the media. Please check if the link is valid and the content is public.');
+    if (processingMsg && processingMsg.message_id) {
+      try {
+        await safeTelegramCall(
+          ctx.telegram.editMessageText.bind(ctx.telegram),
+          ctx.chat.id,
+          processingMsg.message_id,
+          null,
+          'Sorry, I couldn\'t download the media. Please check if the link is valid and the content is public.'
+        );
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Error editing message:`, err);
+        await safeReply(ctx, 'Sorry, I couldn\'t download the media. Please check if the link is valid and the content is public.');
+      }
+    } else {
+      await safeReply(ctx, 'Sorry, I couldn\'t download the media. Please check if the link is valid and the content is public.');
     }
   }
 }
@@ -449,18 +505,47 @@ async function downloadInstagramMedia(ctx, messageText) {
 async function showYouTubeFormats(ctx, youtubeUrl) {
   console.log(`[${new Date().toISOString()}] Getting YouTube formats for: ${youtubeUrl}`);
   
-  const processingMsg = await ctx.reply('Getting available formats... Please wait.');
+  let processingMsg;
+  try {
+    processingMsg = await ctx.reply('Getting available formats... Please wait.');
+  } catch (error) {
+    console.warn(`[${new Date().toISOString()}] Could not send processing message, continuing anyway:`, error.message);
+    processingMsg = null;
+  }
+  
+  // Check for YouTube cookies (outside try block for scope)
+  const youtubeCookiesPath = path.join(__dirname, 'youtube_cookies.txt');
+  const hasCookies = fs.existsSync(youtubeCookiesPath);
   
   try {
+    
     // Get video info and formats
     const infoArgs = [
       youtubeUrl,
       '--list-formats',
-      '--no-playlist'
+      '--no-playlist',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android' // Use Android client to bypass bot detection
     ];
     
+    // Add cookies if available
+    if (hasCookies) {
+      infoArgs.push('--cookies', youtubeCookiesPath);
+      console.log(`[${new Date().toISOString()}] Using YouTube cookies file: ${youtubeCookiesPath}`);
+    } else {
+      console.log(`[${new Date().toISOString()}] No YouTube cookies file found. YouTube may block requests.`);
+      console.log(`[${new Date().toISOString()}] To fix: Export cookies from browser and save as youtube_cookies.txt`);
+    }
+    
     console.log(`[${new Date().toISOString()}] Running yt-dlp to list formats...`);
-    const formatListOutput = await ytDlpWrap.execPromise(infoArgs);
+    
+    // Increase timeout for YouTube operations (5 minutes)
+    const formatListOutput = await Promise.race([
+      ytDlpWrap.execPromise(infoArgs),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('YouTube format listing timeout after 5 minutes')), 300000)
+      )
+    ]);
     
     // Parse format list to extract available formats
     const formatLines = formatListOutput.split('\n').filter(line => 
@@ -471,16 +556,28 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
     const infoArgs2 = [
       youtubeUrl,
       '--print-json',
-      '--no-playlist'
+      '--no-playlist',
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android'
     ];
+    
+    // Add cookies if available
+    if (hasCookies) {
+      infoArgs2.push('--cookies', youtubeCookiesPath);
+    }
     
     let videoTitle = 'YouTube Video';
     try {
-      const videoInfo = await ytDlpWrap.execPromise(infoArgs2);
+      const videoInfo = await Promise.race([
+        ytDlpWrap.execPromise(infoArgs2),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('YouTube info timeout after 2 minutes')), 120000)
+        )
+      ]);
       const info = JSON.parse(videoInfo);
       videoTitle = info.title || 'YouTube Video';
     } catch (e) {
-      console.log(`[${new Date().toISOString()}] Could not get video title`);
+      console.log(`[${new Date().toISOString()}] Could not get video title:`, e.message);
     }
     
     // Parse formats to detect available qualities
@@ -562,7 +659,13 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
     });
     
     // Delete processing message
-    await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+    if (processingMsg && processingMsg.message_id) {
+      try {
+        await safeTelegramCall(ctx.telegram.deleteMessage.bind(ctx.telegram), ctx.chat.id, processingMsg.message_id);
+      } catch (err) {
+        console.warn(`[${new Date().toISOString()}] Could not delete processing message:`, err.message);
+      }
+    }
     
     // Show format selection
     await ctx.reply(
@@ -572,15 +675,57 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
     
   } catch (error) {
     console.error(`[${new Date().toISOString()}] Error getting YouTube formats:`, error);
-    try {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        null,
-        'Sorry, I couldn\'t get the available formats. Please check if the link is valid.'
-      );
-    } catch (err) {
-      ctx.reply('Sorry, I couldn\'t get the available formats. Please check if the link is valid.');
+    
+    // Check if it's a bot detection error or DPAPI error
+    const errorMessage = error.message || '';
+    const errorStderr = error.stderr || '';
+    const isBotDetection = errorMessage.includes('Sign in to confirm') || 
+                           errorMessage.includes('not a bot') ||
+                           errorStderr.includes('Sign in to confirm') ||
+                           errorStderr.includes('not a bot');
+    const isDPAPIError = errorMessage.includes('Failed to decrypt with DPAPI') ||
+                        errorStderr.includes('Failed to decrypt with DPAPI');
+    
+    let errorMsg = 'Sorry, I couldn\'t get the available formats. ';
+    if (isDPAPIError) {
+      errorMsg += '❌ Cookie decryption failed. Please export YouTube cookies manually:\n\n';
+      errorMsg += '1. Install browser extension: "Get cookies.txt LOCALLY"\n';
+      errorMsg += '2. Go to youtube.com and export cookies\n';
+      errorMsg += '3. Save as "youtube_cookies.txt" in the bot folder\n\n';
+      errorMsg += 'Or try downloading without format selection.';
+    } else if (isBotDetection) {
+      errorMsg += '❌ YouTube is blocking requests. You need to add YouTube cookies:\n\n';
+      errorMsg += '1. Export cookies from your browser\n';
+      errorMsg += '2. Save as "youtube_cookies.txt" in the bot folder\n\n';
+      errorMsg += 'Or try downloading without format selection.';
+    } else {
+      errorMsg += 'Please check if the link is valid.';
+    }
+    
+    if (processingMsg && processingMsg.message_id) {
+      try {
+        await safeTelegramCall(
+          ctx.telegram.editMessageText.bind(ctx.telegram),
+          ctx.chat.id,
+          processingMsg.message_id,
+          null,
+          errorMsg
+        );
+      } catch (err) {
+        await safeReply(ctx, errorMsg);
+      }
+    } else {
+      await safeReply(ctx, errorMsg);
+    }
+    
+    // If bot detection, try direct download as fallback
+    if (isBotDetection) {
+      console.log(`[${new Date().toISOString()}] YouTube bot detection detected, attempting direct download...`);
+      try {
+        await downloadYouTubeVideo(ctx, 'best', youtubeUrl, 'YouTube Video');
+      } catch (downloadError) {
+        console.error(`[${new Date().toISOString()}] Direct download also failed:`, downloadError.message);
+      }
     }
   }
 }
@@ -595,17 +740,42 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
     const timestamp = Date.now();
     const outputPath = path.join(tempDir, `youtube_${timestamp}.mp4`);
     
+    // Check for YouTube cookies
+    const youtubeCookiesPath = path.join(__dirname, 'youtube_cookies.txt');
+    const hasCookies = fs.existsSync(youtubeCookiesPath);
+    
+    // Use better format selector - if formatId is 'best', don't specify format and let yt-dlp auto-select
     const ytDlpArgs = [
       youtubeUrl,
-      '-f', formatId,
       '-o', outputPath,
       '--no-playlist',
-      '--merge-output-format', 'mp4'  // Force MP4 container for better phone compatibility
+      '--merge-output-format', 'mp4',  // Force MP4 container for better phone compatibility
+      '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      '--extractor-args', 'youtube:player_client=android' // Use Android client to bypass bot detection
     ];
+    
+    // Add format selector only if it's not 'best' (let yt-dlp auto-select best quality)
+    if (formatId && formatId !== 'best') {
+      ytDlpArgs.splice(1, 0, '-f', formatId);
+    }
+    
+    // Add cookies if available
+    if (hasCookies) {
+      ytDlpArgs.push('--cookies', youtubeCookiesPath);
+      console.log(`[${new Date().toISOString()}] Using YouTube cookies file: ${youtubeCookiesPath}`);
+    } else {
+      console.log(`[${new Date().toISOString()}] No YouTube cookies file found. YouTube may block requests.`);
+    }
     
     console.log(`[${new Date().toISOString()}] Running yt-dlp with args:`, ytDlpArgs);
     
-    const stdout = await ytDlpWrap.execPromise(ytDlpArgs);
+    // Increase timeout for YouTube downloads (10 minutes for large videos)
+    const stdout = await Promise.race([
+      ytDlpWrap.execPromise(ytDlpArgs),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('YouTube download timeout after 10 minutes')), 600000)
+      )
+    ]);
     console.log(`[${new Date().toISOString()}] yt-dlp stdout:`, stdout);
     
     // Find the downloaded file
@@ -628,12 +798,19 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
     if (fileSizeInMB > 50) {
       console.log(`[${new Date().toISOString()}] File too large (${fileSizeInMB.toFixed(2)} MB), deleting...`);
       fs.unlinkSync(actualOutputPath);
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        processingMsg.message_id,
-        null,
-        'File is too large (over 50MB). Telegram bots cannot send files larger than 50MB.'
-      );
+      if (processingMsg && processingMsg.message_id) {
+        try {
+          await safeTelegramCall(
+            ctx.telegram.editMessageText.bind(ctx.telegram),
+            ctx.chat.id,
+            processingMsg.message_id,
+            null,
+            'File is too large (over 50MB). Telegram bots cannot send files larger than 50MB.'
+          );
+        } catch (err) {
+          console.warn(`[${new Date().toISOString()}] Could not edit message:`, err.message);
+        }
+      }
       return;
     }
     
@@ -691,6 +868,91 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
     // Clear user state on error
     userStates.delete(ctx.from.id);
   }
+}
+
+// Helper function to safely send messages with retry and timeout handling
+async function safeReply(ctx, message, extra = {}) {
+  const maxRetries = 5;
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Create a promise with timeout
+      const replyPromise = ctx.reply(message, extra);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Reply timeout after 120 seconds')), 120000)
+      );
+      
+      await Promise.race([replyPromise, timeoutPromise]);
+      return true;
+    } catch (error) {
+      lastError = error;
+      const isTimeout = error.code === 'ETIMEDOUT' || 
+                       error.message.includes('timeout') || 
+                       error.message.includes('ETIMEDOUT') ||
+                       error.errno === 'ETIMEDOUT';
+      
+      console.warn(`[${new Date().toISOString()}] Failed to send message (attempt ${attempt}/${maxRetries}):`, error.message);
+      
+      // If it's a timeout/connection error and we have retries left, wait and retry
+      if (attempt < maxRetries && isTimeout) {
+        const waitTime = Math.min(3000 * attempt, 15000); // Exponential backoff, max 15 seconds
+        console.log(`[${new Date().toISOString()}] Retrying in ${waitTime/1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      // If it's not a timeout or we're out of retries, break
+      if (!isTimeout) {
+        break; // Non-timeout errors don't retry
+      }
+    }
+  }
+  
+  console.error(`[${new Date().toISOString()}] Failed to send message after ${maxRetries} attempts:`, lastError);
+  return false;
+}
+
+// Helper function to safely send Telegram API calls with retry and timeout handling
+async function safeTelegramCall(telegramMethod, ...args) {
+  const maxRetries = 5;
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Create a promise with timeout
+      const callPromise = telegramMethod(...args);
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('API call timeout after 120 seconds')), 120000)
+      );
+      
+      return await Promise.race([callPromise, timeoutPromise]);
+    } catch (error) {
+      lastError = error;
+      const isTimeout = error.code === 'ETIMEDOUT' || 
+                       error.message.includes('timeout') || 
+                       error.message.includes('ETIMEDOUT') ||
+                       error.errno === 'ETIMEDOUT';
+      
+      console.warn(`[${new Date().toISOString()}] Failed Telegram API call (attempt ${attempt}/${maxRetries}):`, error.message);
+      
+      // If it's a timeout/connection error and we have retries left, wait and retry
+      if (attempt < maxRetries && isTimeout) {
+        const waitTime = Math.min(3000 * attempt, 15000); // Exponential backoff, max 15 seconds
+        console.log(`[${new Date().toISOString()}] Retrying API call in ${waitTime/1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      
+      // If it's not a timeout or we're out of retries, break
+      if (!isTimeout) {
+        break; // Non-timeout errors don't retry
+      }
+    }
+  }
+  
+  console.error(`[${new Date().toISOString()}] Failed Telegram API call after ${maxRetries} attempts:`, lastError);
+  throw lastError;
 }
 
 // Helper function to create admin status keyboard (Reply Keyboard Markup)
@@ -779,11 +1041,23 @@ bot.command('stats', (ctx) => {
 
 // Message handler for Instagram links, YouTube links, and admin status button
 bot.on('text', async (ctx) => {
-  const userId = ctx.from.id;
-  const messageText = ctx.message.text;
+  try {
+    // Safety checks
+    if (!ctx || !ctx.message || !ctx.message.text) {
+      console.warn(`[${new Date().toISOString()}] Received text update without message text`);
+      return;
+    }
 
-  // Track user
-  addUser(userId, ctx.from.username, ctx.from.first_name, ctx.from.last_name);
+    if (!ctx.from || !ctx.from.id) {
+      console.warn(`[${new Date().toISOString()}] Received text update without user info`);
+      return;
+    }
+
+    const userId = ctx.from.id;
+    const messageText = ctx.message.text;
+
+    // Track user
+    addUser(userId, ctx.from.username, ctx.from.first_name, ctx.from.last_name);
 
   // Handle admin status button
   if (ADMIN_ID && userId === ADMIN_ID && messageText === '📊 Bot Status') {
@@ -827,41 +1101,99 @@ bot.on('text', async (ctx) => {
     console.log(`[${new Date().toISOString()}] Auto-detected Instagram link from user ${userId}`);
     // Download the media automatically
     await downloadInstagramMedia(ctx, messageText);
+    return;
+  }
+
+    // If message is not a link and not a command, provide helpful message
+    // Only respond if it looks like they might be trying to send a link
+    if (messageText && messageText.length > 10 && !messageText.startsWith('/')) {
+      await ctx.reply('Please send a valid Instagram or YouTube link to download media.\n\nExamples:\n• Instagram: https://www.instagram.com/p/...\n• YouTube: https://www.youtube.com/watch?v=...');
+    }
+  } catch (error) {
+    // Log error but don't let it crash the bot
+    console.error(`[${new Date().toISOString()}] Error in text message handler:`, error);
+    console.error(`[${new Date().toISOString()}] Error stack:`, error.stack);
+    // Error will be caught by bot.catch() handler
+    throw error;
   }
 });
 
 // Error handling
 bot.catch((err, ctx) => {
-  console.error('Error in bot:', err);
-  ctx.reply('An error occurred. Please try again.');
-});
-
-// Set empty bot commands menu so no commands are visible to users
-// Stats is only available to admin via Reply Keyboard Markup button
-bot.telegram.setMyCommands([]);
-
-// Start the bot
-bot.launch().then(async () => {
-  console.log(`[${new Date().toISOString()}] Bot is running...`);
-  console.log(`[${new Date().toISOString()}] yt-dlp binary path: ${ytDlpWrap.getBinaryPath()}`);
-  
-  // Greet admin with statistics
-  if (ADMIN_ID) {
-    try {
-      const stats = getStats();
-      const greetingMessage = `🤖 Bot Started Successfully!\n\n📊 Current Statistics:\n• Total Users: ${stats.totalUsers}\n• New Users Today: ${stats.newUsersToday}\n\nUse the "📊 Bot Status" button to view detailed statistics.`;
-      await bot.telegram.sendMessage(ADMIN_ID, greetingMessage);
-      console.log(`[${new Date().toISOString()}] Admin notification sent`);
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Error sending admin notification:`, error);
-    }
-  } else {
-    console.warn(`[${new Date().toISOString()}] ADMIN_ID not set - admin features will be disabled`);
+  console.error(`[${new Date().toISOString()}] ========== BOT ERROR ==========`);
+  console.error(`[${new Date().toISOString()}] Error type:`, err.constructor.name);
+  console.error(`[${new Date().toISOString()}] Error message:`, err.message);
+  console.error(`[${new Date().toISOString()}] Error stack:`, err.stack);
+  if (ctx) {
+    console.error(`[${new Date().toISOString()}] User ID:`, ctx.from?.id);
+    console.error(`[${new Date().toISOString()}] Username:`, ctx.from?.username);
+    console.error(`[${new Date().toISOString()}] Chat ID:`, ctx.chat?.id);
+    console.error(`[${new Date().toISOString()}] Message text:`, ctx.message?.text);
+    console.error(`[${new Date().toISOString()}] Update type:`, ctx.updateType);
   }
-}).catch((err) => {
-  console.error(`[${new Date().toISOString()}] Error starting bot:`, err);
-  process.exit(1);
+  console.error(`[${new Date().toISOString()}] ====================================`);
+  
+  // Try to send a more helpful error message
+  try {
+    if (ctx && ctx.reply) {
+      ctx.reply('An error occurred. Please try again. If the problem persists, make sure you\'re sending a valid Instagram or YouTube link.');
+    }
+  } catch (replyError) {
+    console.error(`[${new Date().toISOString()}] Failed to send error message:`, replyError);
+  }
 });
+
+// Retry function for bot launch
+async function launchBotWithRetry(maxRetries = 5, delay = 5000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[${new Date().toISOString()}] Attempting to start bot (attempt ${attempt}/${maxRetries})...`);
+      await bot.launch();
+      console.log(`[${new Date().toISOString()}] Bot is running...`);
+      console.log(`[${new Date().toISOString()}] yt-dlp binary path: ${ytDlpWrap.getBinaryPath()}`);
+      
+      // Set empty bot commands menu so no commands are visible to users
+      // Stats is only available to admin via Reply Keyboard Markup button
+      try {
+        await bot.telegram.setMyCommands([]);
+        console.log(`[${new Date().toISOString()}] Bot commands menu configured`);
+      } catch (cmdError) {
+        console.warn(`[${new Date().toISOString()}] Warning: Could not set bot commands:`, cmdError.message);
+      }
+      
+      // Greet admin with statistics
+      if (ADMIN_ID) {
+        try {
+          const stats = getStats();
+          const greetingMessage = `🤖 Bot Started Successfully!\n\n📊 Current Statistics:\n• Total Users: ${stats.totalUsers}\n• New Users Today: ${stats.newUsersToday}\n\nUse the "📊 Bot Status" button to view detailed statistics.`;
+          await bot.telegram.sendMessage(ADMIN_ID, greetingMessage);
+          console.log(`[${new Date().toISOString()}] Admin notification sent`);
+        } catch (error) {
+          console.error(`[${new Date().toISOString()}] Error sending admin notification:`, error);
+        }
+      } else {
+        console.warn(`[${new Date().toISOString()}] ADMIN_ID not set - admin features will be disabled`);
+      }
+      return; // Success, exit function
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Error starting bot (attempt ${attempt}/${maxRetries}):`, err.message);
+      
+      if (attempt < maxRetries) {
+        console.log(`[${new Date().toISOString()}] Retrying in ${delay/1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        // Exponential backoff - increase delay for next retry
+        delay = Math.min(delay * 1.5, 30000); // Max 30 seconds
+      } else {
+        console.error(`[${new Date().toISOString()}] Failed to start bot after ${maxRetries} attempts.`);
+        console.error(`[${new Date().toISOString()}] Last error:`, err);
+        process.exit(1);
+      }
+    }
+  }
+}
+
+// Start the bot with retry mechanism
+launchBotWithRetry();
 
 // Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
