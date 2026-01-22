@@ -1,5 +1,7 @@
-name: Deploy RVBot to VPS
+name: Deploy MusicBot to VPS
 
+# To disable auto-deployment, comment out the 'on:' section below
+# or delete this workflow file
 on:
   push:
     branches:

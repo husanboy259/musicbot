@@ -213,9 +213,19 @@ function findYtDlpPath() {
   return null;
 }
 
+// Add common installation paths to PATH (for Render and other cloud platforms)
+if (process.env.HOME) {
+  const localBin = path.join(process.env.HOME, '.local', 'bin');
+  if (fs.existsSync(localBin) && !process.env.PATH.includes(localBin)) {
+    process.env.PATH = `${localBin}:${process.env.PATH}`;
+  }
+}
+
 const ytDlpPath = findYtDlpPath();
 if (!ytDlpPath) {
   console.error(`[${new Date().toISOString()}] yt-dlp not found. Please install it: pip install yt-dlp`);
+  console.error(`[${new Date().toISOString()}] On Render: The build script should install it automatically.`);
+  console.error(`[${new Date().toISOString()}] If this persists, check that Python and pip are available.`);
   process.exit(1);
 }
 
