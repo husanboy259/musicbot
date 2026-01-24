@@ -4,10 +4,7 @@
   "description": "Telegram bot for downloading Instagram videos",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "node bot.js",
-    "build": "bash build.sh",
-    "postinstall": "bash build.sh"
+    "start": "node bot.js"
   },
   "keywords": [
     "telegram",

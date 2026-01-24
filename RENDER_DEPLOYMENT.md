@@ -8,7 +8,26 @@ This guide will help you deploy your bot on Render.com.
 2. Render.com account (free tier works)
 3. Your Telegram bot token
 
-## Step 1: Create a New Web Service on Render
+## Step 1: Create a New Service on Render
+
+You have two options:
+
+### Option A: Background Worker (Recommended for Bots)
+
+1. Go to [Render Dashboard](https://dashboard.render.com)
+2. Click **New +** → **Background Worker**
+3. Connect your GitHub repository: `husanboy259/musicbot`
+4. Configure the service:
+   - **Name:** `musicbot` (or any name you like)
+   - **Region:** Choose closest to you
+   - **Branch:** `main`
+   - **Root Directory:** `rvbot` (if deploying from subdirectory)
+   - **Runtime:** `Node`
+   - **Build Command:** `npm install && bash build.sh`
+   - **Start Command:** `npm start`
+   - **Plan:** Free (or paid if you prefer)
+
+### Option B: Web Service (Also Works)
 
 1. Go to [Render Dashboard](https://dashboard.render.com)
 2. Click **New +** → **Web Service**
@@ -22,6 +41,8 @@ This guide will help you deploy your bot on Render.com.
    - **Build Command:** `npm install && bash build.sh`
    - **Start Command:** `npm start`
    - **Plan:** Free (or paid if you prefer)
+
+**Note:** The bot now includes a simple HTTP server that binds to port 3000 (or PORT env var) for web service compatibility.
 
 ## Step 2: Add Environment Variables
 

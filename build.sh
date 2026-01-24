@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🔧 Building MusicBot for Render..."
+echo "🔧 Building MusicBot..."
 
 # Create bin directory if it doesn't exist
 mkdir -p bin
@@ -12,10 +12,10 @@ export PATH="$BIN_DIR:$PATH"
 if ! command -v yt-dlp &> /dev/null; then
     echo "📦 Installing yt-dlp..."
     
-    # On Render, prioritize pip installation (works better with virtualenv)
-    # Check if we're in a virtualenv (Render uses this)
+    # Prioritize pip installation (works better with virtualenv on cloud platforms)
+    # Check if we're in a virtualenv (Railway/Render use this)
     if [ -n "$VIRTUAL_ENV" ]; then
-        echo "Detected virtualenv (Render), using pip installation..."
+        echo "Detected virtualenv, using pip installation..."
         if command -v pip3 &> /dev/null; then
             pip3 install yt-dlp
         elif command -v pip &> /dev/null; then
@@ -74,9 +74,9 @@ if command -v yt-dlp &> /dev/null; then
     echo "✅ Build complete!"
 else
     echo "❌ ERROR: yt-dlp installation failed!"
-    echo "   Please check Render logs for more details."
+    echo "   Please check deployment logs for more details."
     echo "   Attempted methods:"
-    echo "   1. Binary download from GitHub"
-    echo "   2. pip/pip3 installation"
+    echo "   1. pip/pip3 installation (in virtualenv or --user)"
+    echo "   2. Binary download from GitHub"
     exit 1
 fi

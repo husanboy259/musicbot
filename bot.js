@@ -4,6 +4,61 @@ const YTDlpWrap = require('yt-dlp-wrap').default;
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const http = require('http');
+
+// Start HTTP server IMMEDIATELY for Render/Railway port detection
+// This must be done before any other code that might fail
+console.log(`[${new Date().toISOString()}] 🚀 Starting MusicBot...`);
+const PORT = process.env.PORT || 3000;
+console.log(`[${new Date().toISOString()}] Using PORT: ${PORT}`);
+let botRunning = false;
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      status: 'ok', 
+      bot: botRunning ? 'running' : 'starting',
+      timestamp: new Date().toISOString()
+    }));
+  } else {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('MusicBot is running! Send /start to your bot on Telegram.');
+  }
+});
+
+// Start server immediately - don't wait for anything
+console.log(`[${new Date().toISOString()}] Starting HTTP server on port ${PORT}...`);
+try {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[${new Date().toISOString()}] ✅ HTTP server listening on 0.0.0.0:${PORT}`);
+    console.log(`[${new Date().toISOString()}] Health check: http://0.0.0.0:${PORT}/health`);
+    
+    // Start the bot AFTER the server is listening
+    // This ensures Render can detect the port before the bot starts
+    setTimeout(() => {
+      if (typeof launchBotWithRetry === 'function') {
+        launchBotWithRetry().then(() => {
+          botRunning = true;
+          console.log(`[${new Date().toISOString()}] Bot startup completed`);
+        }).catch((err) => {
+          console.error(`[${new Date().toISOString()}] Bot startup failed:`, err);
+          // Don't exit - keep the HTTP server running so Render knows the service is up
+        });
+      } else {
+        console.error(`[${new Date().toISOString()}] launchBotWithRetry function not found`);
+      }
+    }, 1000); // Small delay to ensure server is fully ready
+  });
+} catch (err) {
+  console.error(`[${new Date().toISOString()}] ❌ Failed to start HTTP server:`, err);
+  process.exit(1);
+}
+
+server.on('error', (err) => {
+  console.error(`[${new Date().toISOString()}] ❌ HTTP server error:`, err);
+  process.exit(1);
+});
 
 // Create a custom HTTPS agent with longer timeout and keep-alive
 const httpsAgent = new https.Agent({
@@ -17,11 +72,18 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: true
 });
 
+// Get bot token from environment (support both BOT_TOKEN and TELEGRAM_BOT_TOKEN)
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error(`[${new Date().toISOString()}] ERROR: BOT_TOKEN or TELEGRAM_BOT_TOKEN not set in environment variables`);
+  process.exit(1);
+}
+
 // Configure bot with timeout and retry settings
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, {
+const bot = new Telegraf(BOT_TOKEN, {
   telegram: {
-    // Set timeout for API requests (120 seconds - very long for slow/unstable connections)
-    timeout: 120000,
+    // Set timeout for API requests (300 seconds - 5 minutes for large file uploads)
+    timeout: 300000,
     // Retry configuration
     retryAfter: 3000, // Wait 3 seconds before retry
     // Maximum number of retries
@@ -545,9 +607,13 @@ async function downloadInstagramMedia(ctx, messageText) {
     console.log(`[${new Date().toISOString()}] Sending media to user...`);
     
     // Send media file based on type
+    // Use longer timeout for larger files
+    const uploadTimeout = fileSizeInMB > 5 ? 300000 : 180000; // 5 min for large, 3 min for small
+    
     if (actualIsImage) {
       await safeTelegramCall(
         ctx.telegram.sendPhoto.bind(ctx.telegram),
+        uploadTimeout,
         ctx.chat.id,
         { source: actualOutputPath },
         {
@@ -558,6 +624,7 @@ async function downloadInstagramMedia(ctx, messageText) {
     } else {
       await safeTelegramCall(
         ctx.telegram.sendVideo.bind(ctx.telegram),
+        uploadTimeout,
         ctx.chat.id,
         { source: actualOutputPath },
         {
@@ -933,9 +1000,16 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
     }
     
     console.log(`[${new Date().toISOString()}] Sending video to user...`);
+    console.log(`[${new Date().toISOString()}] Video size: ${fileSizeInMB.toFixed(2)} MB - this may take a while to upload...`);
     
-    // Send video file
-    await ctx.telegram.sendVideo(
+    // Send video file using safe wrapper with longer timeout for large files
+    // Large files need more time to upload - use 5 minutes for files over 5MB
+    const uploadTimeout = fileSizeInMB > 5 ? 300000 : 180000; // 5 min for large, 3 min for small
+    console.log(`[${new Date().toISOString()}] Using upload timeout: ${uploadTimeout/1000} seconds`);
+    
+    await safeTelegramCall(
+      ctx.telegram.sendVideo.bind(ctx.telegram),
+      uploadTimeout, // Pass timeout as first argument after method
       ctx.chat.id,
       { source: actualOutputPath },
       {
@@ -1032,8 +1106,22 @@ async function safeReply(ctx, message, extra = {}) {
 }
 
 // Helper function to safely send Telegram API calls with retry and timeout handling
-async function safeTelegramCall(telegramMethod, ...args) {
-  const maxRetries = 5;
+// Usage: safeTelegramCall(method, timeoutMs, ...args) or safeTelegramCall(method, ...args) with default timeout
+async function safeTelegramCall(telegramMethod, timeoutOrFirstArg, ...restArgs) {
+  // Check if second argument is a number (timeout) or first arg
+  let timeoutMs = 300000; // Default 5 minutes
+  let args;
+  
+  if (typeof timeoutOrFirstArg === 'number') {
+    // timeoutMs provided as second argument
+    timeoutMs = timeoutOrFirstArg;
+    args = restArgs;
+  } else {
+    // No timeout provided, use default and treat timeoutOrFirstArg as first arg
+    args = [timeoutOrFirstArg, ...restArgs];
+  }
+  
+  const maxRetries = 3; // Reduced retries for file uploads (they take long)
   let lastError;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1041,7 +1129,7 @@ async function safeTelegramCall(telegramMethod, ...args) {
       // Create a promise with timeout
       const callPromise = telegramMethod(...args);
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('API call timeout after 120 seconds')), 120000)
+        setTimeout(() => reject(new Error(`API call timeout after ${timeoutMs/1000} seconds`)), timeoutMs)
       );
       
       return await Promise.race([callPromise, timeoutPromise]);
@@ -1304,16 +1392,25 @@ async function launchBotWithRetry(maxRetries = 5, delay = 5000) {
       } else {
         console.error(`[${new Date().toISOString()}] Failed to start bot after ${maxRetries} attempts.`);
         console.error(`[${new Date().toISOString()}] Last error:`, err);
-        process.exit(1);
+        // Don't exit - keep HTTP server running for Render port detection
+        // The bot will be in a failed state, but the service will stay up
+        console.error(`[${new Date().toISOString()}] Bot failed to start, but HTTP server will continue running`);
+        throw err; // Re-throw so caller knows it failed
       }
     }
   }
 }
 
-// Start the bot with retry mechanism
-launchBotWithRetry();
-
 // Graceful shutdown
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+  console.log(`[${new Date().toISOString()}] Shutting down...`);
+  server.close();
+  bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+  console.log(`[${new Date().toISOString()}] Shutting down...`);
+  server.close();
+  bot.stop('SIGTERM');
+});
 
