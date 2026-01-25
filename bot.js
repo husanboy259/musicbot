@@ -710,7 +710,8 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
       '--list-formats',
       '--no-playlist',
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      '--extractor-args', 'youtube:player_client=android' // Use Android client to bypass bot detection
+      '--extractor-args', 'youtube:player_client=android', // Use Android client to bypass bot detection
+      '--extractor-args', 'youtube:player_skip=webpage' // Skip webpage to reduce bot detection
     ];
     
     // Add cookies if available
@@ -871,17 +872,100 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
     const isDPAPIError = errorMessage.includes('Failed to decrypt with DPAPI') ||
                         errorStderr.includes('Failed to decrypt with DPAPI');
     
+    // Try to get video title even if format listing failed
+    let videoTitle = 'YouTube Video';
+    try {
+      const titleArgs = [
+        youtubeUrl,
+        '--print', '%(title)s',
+        '--no-playlist',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        '--extractor-args', 'youtube:player_client=android',
+        '--extractor-args', 'youtube:player_skip=webpage'
+      ];
+      if (hasCookies) {
+        titleArgs.push('--cookies', youtubeCookiesPath);
+      }
+      const titleOutput = await Promise.race([
+        ytDlpWrap.execPromise(titleArgs),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Title fetch timeout')), 30000)
+        )
+      ]);
+      videoTitle = titleOutput.trim() || 'YouTube Video';
+    } catch (e) {
+      console.log(`[${new Date().toISOString()}] Could not get video title:`, e.message);
+    }
+    
+    // Show fallback format list when format listing is blocked
+    if (isBotDetection || isDPAPIError) {
+      console.log(`[${new Date().toISOString()}] YouTube blocked format listing, showing fallback format list...`);
+      
+      // Create fallback format list with common YouTube formats
+      const fallbackFormats = [
+        { quality: '1080p', id: 'bestvideo[height<=1080]+bestaudio/best[height<=1080]' },
+        { quality: '720p', id: 'bestvideo[height<=720]+bestaudio/best[height<=720]' },
+        { quality: '480p', id: 'bestvideo[height<=480]+bestaudio/best[height<=480]' },
+        { quality: '360p', id: 'bestvideo[height<=360]+bestaudio/best[height<=360]' },
+        { quality: 'Best', id: 'best' },
+        { quality: 'Audio', id: 'bestaudio' }
+      ];
+      
+      // Create keyboard buttons (2 per row)
+      const buttons = [];
+      for (let i = 0; i < fallbackFormats.length; i += 2) {
+        const row = [];
+        row.push(Markup.button.text(fallbackFormats[i].quality));
+        if (i + 1 < fallbackFormats.length) {
+          row.push(Markup.button.text(fallbackFormats[i + 1].quality));
+        }
+        buttons.push(row);
+      }
+      
+      // Store format mapping in user state
+      const formatMapping = {};
+      fallbackFormats.forEach(f => {
+        formatMapping[f.quality] = f.id;
+      });
+      
+      userStates.set(ctx.from.id, {
+        type: 'youtube_format_selection',
+        url: youtubeUrl,
+        formats: formatMapping,
+        title: videoTitle
+      });
+      
+      // Delete processing message
+      if (processingMsg && processingMsg.message_id) {
+        try {
+          await safeTelegramCall(ctx.telegram.deleteMessage.bind(ctx.telegram), ctx.chat.id, processingMsg.message_id);
+        } catch (err) {
+          console.warn(`[${new Date().toISOString()}] Could not delete processing message:`, err.message);
+        }
+      }
+      
+      // Show format selection with warning
+      const warningMsg = isDPAPIError 
+        ? '⚠️ Cookie decryption failed. Using fallback format list:\n\n'
+        : '⚠️ YouTube blocked format listing. Using fallback format list:\n\n';
+      
+      await ctx.reply(
+        `${warningMsg}📹 ${videoTitle}\n\nSelect a video format:\n\n` +
+        `💡 Tip: Add YouTube cookies for better format selection.\n` +
+        `See YOUTUBE_COOKIES_GUIDE.md for instructions.`,
+        Markup.keyboard(buttons).resize().oneTime()
+      );
+      
+      return; // Exit function after showing fallback formats
+    }
+    
+    // For other errors, show error message
     let errorMsg = 'Sorry, I couldn\'t get the available formats. ';
     if (isDPAPIError) {
       errorMsg += '❌ Cookie decryption failed. Please export YouTube cookies manually:\n\n';
       errorMsg += '1. Install browser extension: "Get cookies.txt LOCALLY"\n';
       errorMsg += '2. Go to youtube.com and export cookies\n';
       errorMsg += '3. Save as "youtube_cookies.txt" in the bot folder\n\n';
-      errorMsg += 'Or try downloading without format selection.';
-    } else if (isBotDetection) {
-      errorMsg += '❌ YouTube is blocking requests. You need to add YouTube cookies:\n\n';
-      errorMsg += '1. Export cookies from your browser\n';
-      errorMsg += '2. Save as "youtube_cookies.txt" in the bot folder\n\n';
       errorMsg += 'Or try downloading without format selection.';
     } else {
       errorMsg += 'Please check if the link is valid.';
@@ -901,16 +985,6 @@ async function showYouTubeFormats(ctx, youtubeUrl) {
       }
     } else {
       await safeReply(ctx, errorMsg);
-    }
-    
-    // If bot detection, try direct download as fallback
-    if (isBotDetection) {
-      console.log(`[${new Date().toISOString()}] YouTube bot detection detected, attempting direct download...`);
-      try {
-        await downloadYouTubeVideo(ctx, 'best', youtubeUrl, 'YouTube Video');
-      } catch (downloadError) {
-        console.error(`[${new Date().toISOString()}] Direct download also failed:`, downloadError.message);
-      }
     }
   }
 }
@@ -936,7 +1010,8 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
       '--no-playlist',
       '--merge-output-format', 'mp4',  // Force MP4 container for better phone compatibility
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      '--extractor-args', 'youtube:player_client=android' // Use Android client to bypass bot detection
+      '--extractor-args', 'youtube:player_client=android', // Use Android client to bypass bot detection
+      '--extractor-args', 'youtube:player_skip=webpage' // Skip webpage to reduce bot detection
     ];
     
     // Add format selector only if it's not 'best' (let yt-dlp auto-select best quality)
@@ -1046,15 +1121,37 @@ async function downloadYouTubeVideo(ctx, formatId, youtubeUrl, videoTitle) {
       console.error(`[${new Date().toISOString()}] yt-dlp stderr:`, error.stderr);
     }
     
+    // Check if it's a bot detection error
+    const errorMessage = error.message || '';
+    const errorStderr = error.stderr || '';
+    const isBotDetection = errorMessage.includes('Sign in to confirm') || 
+                           errorMessage.includes('not a bot') ||
+                           errorStderr.includes('Sign in to confirm') ||
+                           errorStderr.includes('not a bot') ||
+                           errorMessage.includes('blocking') ||
+                           errorStderr.includes('blocking');
+    
+    let errorMsg = 'Sorry, I couldn\'t download the video. ';
+    if (isBotDetection) {
+      errorMsg += '❌ YouTube is blocking requests. You need to add YouTube cookies:\n\n';
+      errorMsg += '1. Install browser extension: "Get cookies.txt LOCALLY"\n';
+      errorMsg += '2. Go to youtube.com and export cookies\n';
+      errorMsg += '3. Save as "youtube_cookies.txt" in the bot folder\n\n';
+      errorMsg += 'See YOUTUBE_COOKIES_GUIDE.md for detailed instructions.';
+    } else {
+      errorMsg += 'Please try selecting a different format or check if the link is valid.';
+    }
+    
     try {
-      await ctx.telegram.editMessageText(
+      await safeTelegramCall(
+        ctx.telegram.editMessageText.bind(ctx.telegram),
         ctx.chat.id,
         processingMsg.message_id,
         null,
-        'Sorry, I couldn\'t download the video. Please try selecting a different format.'
+        errorMsg
       );
     } catch (err) {
-      ctx.reply('Sorry, I couldn\'t download the video. Please try selecting a different format.');
+      await safeReply(ctx, errorMsg);
     }
     
     // Clear user state on error
@@ -1108,12 +1205,18 @@ async function safeReply(ctx, message, extra = {}) {
 // Helper function to safely send Telegram API calls with retry and timeout handling
 // Usage: safeTelegramCall(method, timeoutMs, ...args) or safeTelegramCall(method, ...args) with default timeout
 async function safeTelegramCall(telegramMethod, timeoutOrFirstArg, ...restArgs) {
-  // Check if second argument is a number (timeout) or first arg
+  // Check if second argument is a reasonable timeout value (between 1000ms and 600000ms)
+  // This prevents user IDs or chat IDs (typically > 100000000) from being mistaken as timeouts
   let timeoutMs = 300000; // Default 5 minutes
   let args;
   
-  if (typeof timeoutOrFirstArg === 'number') {
-    // timeoutMs provided as second argument
+  // Only treat as timeout if it's a number AND in reasonable range (1s to 10min) AND not a chat/user ID
+  // Chat IDs are typically 9-10 digits (>= 100000000), so we exclude those
+  if (typeof timeoutOrFirstArg === 'number' && 
+      timeoutOrFirstArg >= 1000 && 
+      timeoutOrFirstArg <= 600000 &&
+      timeoutOrFirstArg < 1000000) { // Additional safety: definitely not a chat ID
+    // timeoutMs provided as second argument (reasonable timeout range: 1s to 10min)
     timeoutMs = timeoutOrFirstArg;
     args = restArgs;
   } else {
@@ -1127,9 +1230,11 @@ async function safeTelegramCall(telegramMethod, timeoutOrFirstArg, ...restArgs) 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       // Create a promise with timeout
+      // Ensure timeoutMs is within safe range (prevent overflow)
+      const safeTimeout = Math.min(Math.max(timeoutMs, 1000), 600000); // Clamp between 1s and 10min
       const callPromise = telegramMethod(...args);
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error(`API call timeout after ${timeoutMs/1000} seconds`)), timeoutMs)
+        setTimeout(() => reject(new Error(`API call timeout after ${safeTimeout/1000} seconds`)), safeTimeout)
       );
       
       return await Promise.race([callPromise, timeoutPromise]);

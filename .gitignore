@@ -5,6 +5,7 @@ temp/
 *.mp4
 *.webm
 *.mkv
+*.m4a
 .DS_Store
 users.json
 
@@ -18,3 +19,4 @@ users.json
 Thumbs.db
 
 cookies.txt
+youtube_cookies.txt

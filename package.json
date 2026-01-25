@@ -1,7 +1,7 @@
 {
   "name": "rvbot",
   "version": "1.0.1",
-  "description": "Telegram bot for downloading Instagram videos",
+  "description": "Telegram bot for downloading Instagram and YouTube videos with format selection",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -10,7 +10,10 @@
     "telegram",
     "bot",
     "instagram",
-    "downloader"
+    "youtube",
+    "downloader",
+    "video-downloader",
+    "media-downloader"
   ],
   "author": "",
   "license": "ISC",
